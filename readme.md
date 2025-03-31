@@ -772,6 +772,444 @@ information sources and warn about particular gotchas:
   * [Compared to ApprovalTests](/docs/compared-to-approvaltests.md)<!-- endInclude -->
 
 
+
+
+
+````
+#!/usr/bin/env node
+
+const fs = require('fs');
+const path = require('path');
+const yaml = require('js-yaml');
+const Handlebars = require('handlebars');
+const mkdirp = require('mkdirp');
+
+// Configuration
+const config = {
+  swaggerDir: './api/spec/',
+  outputDir: './tests/api/',
+  templates: {
+    feature: './templates/feature.template',
+    steps: './templates/steps.template',
+    page: './templates/page.template'
+  }
+};
+
+// Ensure templates directory exists
+if (!fs.existsSync('./templates')) {
+  fs.mkdirSync('./templates');
+}
+
+// Create template files if they don't exist
+const featureTemplate = `Feature: {{featureName}}
+  As an API consumer
+  I want to interact with the {{name}} endpoint
+  So that I can {{purpose}}
+
+{{#each scenarios}}
+  Scenario: {{this.name}} for {{../path}}
+    Given I have a request for "{{../path}}"
+    When I send a {{../method}} request with {{#if this.body}}the following body:
+      """
+      {{this.body}}
+      """{{else}}no body{{/if}}
+    Then I should receive a response with status {{this.expectedStatus}}
+    And the response should match the following schema:
+      """
+      {{this.expectedResponse}}
+      """
+{{/each}}
+`;
+
+const stepsTemplate = `import { Given, When, Then } from '@cucumber/cucumber';
+import { Actor } from '@serenity-js/core';
+import { CallAnApi, LastResponse, Send } from '@serenity-js/rest';
+import { Ensure, equals, includes } from '@serenity-js/assertions';
+import { PerformRequest } from '../tasks/PerformRequest';
+import { partialMatch } from '../utils/partialMatch';
+
+Given('{actor} has a request for {string}', async (actor: Actor, endpoint: string) => {
+    return actor.remember('endpoint', endpoint);
+});
+
+When('{actor} sends a {word} request with no body', async (actor: Actor, method: string) => {
+    return actor.attemptsTo(
+        PerformRequest[method.toLowerCase()](actor.recall('endpoint'), {})
+    );
+});
+
+When('{actor} sends a {word} request with the following body:', async (actor: Actor, method: string, body: string) => {
+    const parsedBody = JSON.parse(body);
+    return actor.attemptsTo(
+        PerformRequest[method.toLowerCase()](actor.recall('endpoint'), parsedBody)
+    );
+});
+
+Then('{actor} should receive a response with status {int}', async (actor: Actor, statusCode: number) => {
+    return actor.attemptsTo(
+        Ensure.that(LastResponse.status(), equals(statusCode))
+    );
+});
+
+Then('{actor} should receive a response matching the following schema:', async (actor: Actor, expectedSchema: string) => {
+    const expectedObj = JSON.parse(expectedSchema);
+    return actor.attemptsTo(
+        Ensure.that(LastResponse.body(), partialMatch(expectedObj))
+    );
+});
+`;
+
+const pageTemplate = `import { Task } from '@serenity-js/core';
+import { CallAnApi, Send } from '@serenity-js/rest';
+
+export class PerformRequest {
+    static get(endpoint: string, queryParams = {}) {
+        return Task.where(\`#actor calls GET \${endpoint}\`,
+            Send.a(CallAnApi.get(endpoint).with(queryParams))
+        );
+    }
+    
+    static post(endpoint: string, body = {}) {
+        return Task.where(\`#actor calls POST \${endpoint}\`,
+            Send.a(CallAnApi.post(endpoint).with(body))
+        );
+    }
+    
+    static put(endpoint: string, body = {}) {
+        return Task.where(\`#actor calls PUT \${endpoint}\`,
+            Send.a(CallAnApi.put(endpoint).with(body))
+        );
+    }
+    
+    static delete(endpoint: string, params = {}) {
+        return Task.where(\`#actor calls DELETE \${endpoint}\`,
+            Send.a(CallAnApi.delete(endpoint).with(params))
+        );
+    }
+    
+    static patch(endpoint: string, body = {}) {
+        return Task.where(\`#actor calls PATCH \${endpoint}\`,
+            Send.a(CallAnApi.patch(endpoint).with(body))
+        );
+    }
+}
+`;
+
+const utilTemplate = `export function partialMatch(expected) {
+    return actual => {
+        // Check that each property in expected exists in actual with the same value
+        return Object.keys(expected).every(key => {
+            if (typeof expected[key] === 'object' && expected[key] !== null && actual[key] !== null) {
+                return partialMatch(expected[key])(actual[key]);
+            }
+            return JSON.stringify(actual[key]) === JSON.stringify(expected[key]);
+        });
+    };
+}
+`;
+
+// Create template files
+if (!fs.existsSync('./templates/feature.template')) {
+  fs.writeFileSync('./templates/feature.template', featureTemplate);
+}
+if (!fs.existsSync('./templates/steps.template')) {
+  fs.writeFileSync('./templates/steps.template', stepsTemplate);
+}
+if (!fs.existsSync('./templates/page.template')) {
+  fs.writeFileSync('./templates/page.template', pageTemplate);
+}
+
+// Create utility function directory and file
+mkdirp.sync('./tests/api/utils');
+if (!fs.existsSync('./tests/api/utils/partialMatch.ts')) {
+  fs.writeFileSync('./tests/api/utils/partialMatch.ts', utilTemplate);
+}
+
+// Compile templates
+const compileTemplate = (templatePath) => {
+  const templateContent = fs.readFileSync(templatePath, 'utf8');
+  return Handlebars.compile(templateContent);
+};
+
+// Helper function to create a camelCase version of a string
+const toCamelCase = (str) => {
+  return str.replace(/(?:^\w|[A-Z]|\b\w)/g, (word, index) => {
+    return index === 0 ? word.toLowerCase() : word.toUpperCase();
+  }).replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '');
+};
+
+// Helper function to create a title case version of a string
+const toTitleCase = (str) => {
+  return str.replace(/\w\S*/g, (txt) => {
+    return txt.charAt(0).toUpperCase() + txt.substr(1).toLowerCase();
+  });
+};
+
+// Function to generate the test scenarios for each endpoint
+const generateTestScenarios = (path, method, endpoint) => {
+  const scenarios = [
+    {
+      name: 'Default case',
+      body: endpoint.requestBody ? JSON.stringify(generateSampleBody(endpoint.requestBody), null, 2) : '',
+      expectedStatus: 200,
+      expectedResponse: JSON.stringify({ isError: false, error: null, total_records: 100 }, null, 2)
+    },
+    {
+      name: 'Edge case',
+      body: endpoint.requestBody ? JSON.stringify(generateEdgeCaseBody(endpoint.requestBody), null, 2) : '',
+      expectedStatus: 200,
+      expectedResponse: JSON.stringify({ isError: false, error: null, total_records: 0 }, null, 2)
+    },
+    {
+      name: 'Error case',
+      body: endpoint.requestBody ? JSON.stringify(generateErrorCaseBody(endpoint.requestBody), null, 2) : '',
+      expectedStatus: 400,
+      expectedResponse: JSON.stringify({ isError: true, error: { code: 'BAD_REQUEST', message: 'Invalid request parameters' }, total_records: null }, null, 2)
+    },
+    {
+      name: 'Exception case',
+      body: endpoint.requestBody ? JSON.stringify(generateExceptionCaseBody(endpoint.requestBody), null, 2) : '',
+      expectedStatus: 500,
+      expectedResponse: JSON.stringify({ isError: true, error: { code: 'INTERNAL_SERVER_ERROR', message: 'An unexpected error occurred' }, total_records: null }, null, 2)
+    }
+  ];
+
+  return scenarios;
+};
+
+// Generate sample request bodies based on the Swagger schema
+const generateSampleBody = (requestBody) => {
+  if (!requestBody || !requestBody.content || !requestBody.content['application/json'] || !requestBody.content['application/json'].schema) {
+    return {};
+  }
+
+  const schema = requestBody.content['application/json'].schema;
+  return generateSampleFromSchema(schema);
+};
+
+const generateEdgeCaseBody = (requestBody) => {
+  // Generate edge case data (e.g., empty arrays, minimum values)
+  const sample = generateSampleBody(requestBody);
+  
+  // Modify sample for edge cases
+  Object.keys(sample).forEach(key => {
+    if (Array.isArray(sample[key])) {
+      sample[key] = [];
+    } else if (typeof sample[key] === 'number') {
+      sample[key] = 0;
+    } else if (typeof sample[key] === 'string') {
+      sample[key] = '';
+    }
+  });
+  
+  return sample;
+};
+
+const generateErrorCaseBody = (requestBody) => {
+  // Generate invalid data to trigger validation errors
+  const sample = generateSampleBody(requestBody);
+  
+  // Make one field invalid
+  const keys = Object.keys(sample);
+  if (keys.length > 0) {
+    const randomKey = keys[0];
+    if (typeof sample[randomKey] === 'number') {
+      sample[randomKey] = 'invalid_number';
+    } else if (typeof sample[randomKey] === 'string') {
+      sample[randomKey] = 999;
+    } else if (typeof sample[randomKey] === 'boolean') {
+      sample[randomKey] = 'not_a_boolean';
+    }
+  }
+  
+  return sample;
+};
+
+const generateExceptionCaseBody = (requestBody) => {
+  // Generate data that might cause server exceptions
+  const sample = generateSampleBody(requestBody);
+  
+  // Add fields that might cause exceptions
+  sample.trigger_exception = true;
+  
+  // Make a field extremely large or with special characters
+  const keys = Object.keys(sample);
+  if (keys.length > 0) {
+    const randomKey = keys[0];
+    if (typeof sample[randomKey] === 'string') {
+      sample[randomKey] = 'a'.repeat(10000) + "'); DROP TABLE users; --";
+    }
+  }
+  
+  return sample;
+};
+
+const generateSampleFromSchema = (schema) => {
+  if (!schema) return {};
+  
+  if (schema.$ref) {
+    // Handle reference to another schema (simplified for this example)
+    return { refObject: 'Sample reference object' };
+  }
+  
+  if (schema.type === 'object' && schema.properties) {
+    const result = {};
+    Object.keys(schema.properties).forEach(propName => {
+      result[propName] = generateSampleValueForProperty(schema.properties[propName]);
+    });
+    return result;
+  }
+  
+  if (schema.type === 'array' && schema.items) {
+    return [generateSampleFromSchema(schema.items)];
+  }
+  
+  // Default empty object
+  return {};
+};
+
+const generateSampleValueForProperty = (property) => {
+  if (!property) return null;
+  
+  if (property.$ref) {
+    return { subObject: 'Sample sub-object' };
+  }
+  
+  switch (property.type) {
+    case 'string':
+      if (property.enum && property.enum.length > 0) {
+        return property.enum[0];
+      }
+      if (property.format === 'date-time') {
+        return new Date().toISOString();
+      }
+      if (property.format === 'date') {
+        return new Date().toISOString().split('T')[0];
+      }
+      if (property.format === 'email') {
+        return 'user@example.com';
+      }
+      if (property.format === 'uuid') {
+        return '00000000-0000-0000-0000-000000000000';
+      }
+      return 'sample_string';
+    
+    case 'integer':
+    case 'number':
+      return 123;
+    
+    case 'boolean':
+      return true;
+    
+    case 'array':
+      return property.items ? [generateSampleValueForProperty(property.items)] : [];
+    
+    case 'object':
+      if (property.properties) {
+        const nestedObj = {};
+        Object.keys(property.properties).forEach(key => {
+          nestedObj[key] = generateSampleValueForProperty(property.properties[key]);
+        });
+        return nestedObj;
+      }
+      return {};
+    
+    default:
+      return null;
+  }
+};
+
+// Main function to process Swagger files and generate tests
+const processSwaggerFiles = async () => {
+  // Create output directory if it doesn't exist
+  if (!fs.existsSync(config.outputDir)) {
+    fs.mkdirSync(config.outputDir, { recursive: true });
+  }
+  
+  // Create tasks directory if it doesn't exist
+  const tasksDir = path.join(config.outputDir, 'tasks');
+  if (!fs.existsSync(tasksDir)) {
+    fs.mkdirSync(tasksDir, { recursive: true });
+  }
+  
+  // Create page object file
+  const pageTemplate = compileTemplate(config.templates.page);
+  fs.writeFileSync(path.join(tasksDir, 'PerformRequest.ts'), pageTemplate());
+  
+  // Create step definitions directory if it doesn't exist
+  const stepsDir = path.join(config.outputDir, 'step_definitions');
+  if (!fs.existsSync(stepsDir)) {
+    fs.mkdirSync(stepsDir, { recursive: true });
+  }
+  
+  // Create step definitions file
+  const stepsTemplate = compileTemplate(config.templates.steps);
+  fs.writeFileSync(path.join(stepsDir, 'api_steps.ts'), stepsTemplate());
+  
+  // Create features directory if it doesn't exist
+  const featuresDir = path.join(config.outputDir, 'features');
+  if (!fs.existsSync(featuresDir)) {
+    fs.mkdirSync(featuresDir, { recursive: true });
+  }
+  
+  // Read Swagger files
+  const swaggerFiles = fs.readdirSync(config.swaggerDir)
+    .filter(file => file.endsWith('.yaml') || file.endsWith('.yml') || file.endsWith('.json'));
+  
+  for (const file of swaggerFiles) {
+    console.log(`Processing ${file}...`);
+    const filePath = path.join(config.swaggerDir, file);
+    const content = fs.readFileSync(filePath, 'utf8');
+    
+    let swaggerDoc;
+    if (file.endsWith('.json')) {
+      swaggerDoc = JSON.parse(content);
+    } else {
+      swaggerDoc = yaml.load(content);
+    }
+    
+    // Process each path in the Swagger doc
+    const paths = swaggerDoc.paths || {};
+    for (const [path, pathItem] of Object.entries(paths)) {
+      for (const [method, endpoint] of Object.entries(pathItem)) {
+        if (['get', 'post', 'put', 'delete', 'patch'].includes(method.toLowerCase())) {
+          console.log(`Generating tests for ${method.toUpperCase()} ${path}`);
+          
+          // Generate feature file
+          const featureTemplate = compileTemplate(config.templates.feature);
+          const featureName = endpoint.summary || `${method.toUpperCase()} ${path}`;
+          const sanitizedPath = path.replace(/[{}]/g, '').replace(/\//g, '_');
+          const featureFileName = `${method.toLowerCase()}${sanitizedPath}.feature`;
+          
+          const scenarios = generateTestScenarios(path, method, endpoint);
+          
+          const featureContent = featureTemplate({
+            featureName,
+            name: endpoint.operationId || `${method}${sanitizedPath}`,
+            purpose: endpoint.description || `access the ${path} endpoint`,
+            path,
+            method: method.toUpperCase(),
+            scenarios
+          });
+          
+          fs.writeFileSync(path.join(featuresDir, featureFileName), featureContent);
+        }
+      }
+    }
+  }
+  
+  console.log('Test generation completed successfully!');
+};
+
+// Run the main function
+processSwaggerFiles().catch(error => {
+  console.error('Error generating tests:', error);
+  process.exit(1);
+});
+
+
+````
+
 ## Icon
 
 [Helmet](https://thenounproject.com/term/helmet/9554/) designed
